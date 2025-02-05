@@ -48,6 +48,10 @@ class GRPOScriptArguments(ScriptArguments):
         default_factory=lambda: ["accuracy", "format"],
         metadata={"help": "List of reward functions. Possible values: 'accuracy', 'format'"},
     )
+    dataset_configs: list[str] = field(
+        default_factory=lambda: ["default"],
+        metadata={"help": "List of dataset configurations to use. Corresponds to the `name` argument of the `datasets.load_dataset` function."},
+    )
 
 
 def accuracy_reward(completions, solution, **kwargs):
@@ -78,7 +82,11 @@ def accuracy_reward(completions, solution, **kwargs):
                 extraction_mode="first_match",
             )
             # Reward 1 if the content is the same as the ground truth, 0 otherwise
-            reward = float(verify(answer_parsed, gold_parsed))
+            try:
+                reward = float(verify(answer_parsed, gold_parsed))
+            except Exception as e:
+                print("Error in verification: ", e)
+                reward = 0.0
         else:
             # If the gold solution is not parseable, we reward 1 to skip this example
             reward = 1.0
@@ -88,11 +96,37 @@ def accuracy_reward(completions, solution, **kwargs):
     return rewards
 
 
+# def format_reward(completions, **kwargs):
+#     """Reward function that checks if the completion has a specific format."""
+#     pattern = r"^<think>.*?</think><answer>.*?</answer>$"
+#     completion_contents = [completion[0]["content"] for completion in completions]
+#     matches = [re.match(pattern, content) for content in completion_contents]
+#     return [1.0 if match else 0.0 for match in matches]
+
+
+# def format_reward(completions, **kwargs):
+#     """Reward function that checks if the completion has a specific format."""
+#     pattern = r"^<think>.*?</think>.*?\\boxed\{.*?\}"
+#     pattern0 = r"^<think>.*?</think>"
+#     pattern1 = r"\\boxed\{.*?\}"
+
+#     def match_pattern(content):
+#         if re.match(pattern, content):
+#             return 1.0
+#         elif re.match(pattern0, content) or re.match(pattern1, content):
+#             return 0.5
+#         else:
+#             return 0.0
+
+#     completion_contents = [completion[0]["content"] for completion in completions]
+#     return [match_pattern(content) for content in completion_contents]
+
+
 def format_reward(completions, **kwargs):
     """Reward function that checks if the completion has a specific format."""
-    pattern = r"^<think>.*?</think><answer>.*?</answer>$"
+    pattern = r'\\boxed\{.*?\}'
     completion_contents = [completion[0]["content"] for completion in completions]
-    matches = [re.match(pattern, content) for content in completion_contents]
+    matches = [re.search(pattern, content) for content in completion_contents]
     return [1.0 if match else 0.0 for match in matches]
 
 
@@ -101,11 +135,14 @@ reward_funcs_registry = {
     "format": format_reward,
 }
 
-SYSTEM_PROMPT = (
-    "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant "
-    "first thinks about the reasoning process in the mind and then provides the user with the answer. The reasoning "
-    "process and answer are enclosed within <think> </think> and <answer> </answer> tags, respectively, i.e., "
-    "<think> reasoning process here </think><answer> answer here </answer>"
+# SYSTEM_PROMPT = (
+#     "A conversation between User and Assistant. The user asks a question, and the Assistant solves it. The assistant "
+#     "first thinks about the reasoning process in the mind and then provides the user with the answer. The thinking "
+#     "process should be enclosed within <think> </think> tags, i.e., <think> thinking process here </think> answer here."
+# )
+
+MATH_PROMPT = (
+    "Please reason step by step, and put your final answer within \boxed{}.\n"
 )
 
 
@@ -145,7 +182,17 @@ def main(script_args, training_args, model_args):
         logger.info(f"Checkpoint detected, resuming training at {last_checkpoint=}.")
 
     # Load the dataset
-    dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
+    print(script_args.dataset_configs)
+    # dataset = load_dataset(script_args.dataset_name, name=script_args.dataset_config)
+    train_dataset_list = []
+    test_dataset_list = []
+    for dataset_config in script_args.dataset_configs:
+        train_dataset_list.append(load_dataset(script_args.dataset_name, name=dataset_config, split=script_args.dataset_train_split))
+        test_dataset_list.append(load_dataset(script_args.dataset_name, name=dataset_config, split=script_args.dataset_test_split))
+    train_dataset = datasets.concatenate_datasets(train_dataset_list)
+    shuffled_train_dataset = train_dataset.shuffle(seed=training_args.seed)
+    test_dataset = datasets.concatenate_datasets(test_dataset_list)
+    dataset = datasets.DatasetDict({script_args.dataset_train_split: shuffled_train_dataset, script_args.dataset_test_split: test_dataset})
 
     # Get reward functions
     reward_funcs = [reward_funcs_registry[func] for func in script_args.reward_funcs]
@@ -154,7 +201,7 @@ def main(script_args, training_args, model_args):
     def make_conversation(example):
         return {
             "prompt": [
-                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "system", "content": MATH_PROMPT},
                 {"role": "user", "content": example["problem"]},
             ],
         }
